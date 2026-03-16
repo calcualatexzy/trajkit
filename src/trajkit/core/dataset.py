@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import polars as pl
 
@@ -150,6 +150,57 @@ class TrajectoryDataset:
             frame_ids=frame_ids,
         )
 
+    def get_image_channels(
+        self,
+        trajectory_id: str,
+        *,
+        kind: Literal["path", "bytes"] = "path",
+        keep_null: bool = False,
+    ) -> dict[str, dict[str, list[Any]]]:
+        return self.get_trajectory(trajectory_id).image_channels(kind=kind, keep_null=keep_null)
+
+    def get_image_ref(
+        self,
+        trajectory_id: str,
+        *,
+        idx: int | None = None,
+        frame_id: int | None = None,
+        t: float | None = None,
+        camera: int = 0,
+        kind: Literal["auto", "path", "bytes"] = "auto",
+        modality: Literal["rgb", "depth", "other", "any"] = "any",
+    ) -> Any:
+        return self.get_trajectory(trajectory_id).get_image_ref(
+            idx=idx,
+            frame_id=frame_id,
+            t=t,
+            camera=camera,
+            kind=kind,
+            modality=modality,
+        )
+
+    def get_image(
+        self,
+        trajectory_id: str,
+        *,
+        idx: int | None = None,
+        frame_id: int | None = None,
+        t: float | None = None,
+        camera: int = 0,
+        modality: Literal["rgb", "depth", "other", "any"] = "any",
+        source: Literal["auto", "bytes", "path"] = "auto",
+        decode: bool = True,
+    ) -> Any:
+        return self.get_trajectory(trajectory_id).get_image(
+            idx=idx,
+            frame_id=frame_id,
+            t=t,
+            camera=camera,
+            modality=modality,
+            source=source,
+            decode=decode,
+        )
+
     def summary(self, refresh: bool = False) -> dict[str, object]:
         if self._summary_cache is None or refresh:
             self._summary_cache = summarize_dataset(self._lazy_frame)
@@ -221,9 +272,10 @@ class TrajectoryDataset:
         return plot_cluster_embedding(self.feature_table(), self._cluster_result.labels, ax=ax)
 
     def plot_modality_coverage(self, ax=None):
-        frame = self._lazy_frame.select(
-            [c for c in ("state_vec", "action_vec", "image_0_path", "image_1_path") if c in self._lazy_frame.collect_schema().names()]
-        ).collect()
+        schema_names = self._lazy_frame.collect_schema().names()
+        image_cols = [c for c in schema_names if c.startswith("image_") and (c.endswith("_path") or c.endswith("_bytes"))]
+        keep = [c for c in ("state_vec", "action_vec") if c in schema_names] + sorted(image_cols)
+        frame = self._lazy_frame.select(keep).collect()
         return plot_modality_coverage(frame, ax=ax)
 
 

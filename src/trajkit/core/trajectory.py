@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import bisect
+from io import BytesIO
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import polars as pl
@@ -10,6 +12,9 @@ import polars as pl
 from trajkit.analysis.similarity import nearest_neighbors
 from trajkit.core.schema import FrameBatchView, FrameRecord
 from trajkit.preprocess.features import trajectory_features
+
+if TYPE_CHECKING:
+    from trajkit.core.dataset import TrajectoryDataset
 
 
 class Trajectory:
@@ -41,10 +46,28 @@ class Trajectory:
         return self._frame["action_vec"]
 
     def image_paths(self) -> dict[str, list[str]]:
-        out: dict[str, list[str]] = {}
-        for col in ("image_0_path", "image_1_path"):
-            if col in self._frame.columns:
-                out[col] = [v for v in self._frame[col].to_list() if v is not None]
+        groups = self.image_channels(kind="path", keep_null=False)
+        return {**groups["rgb"], **groups["depth"], **groups["other"]}
+
+    def image_channels(
+        self,
+        *,
+        kind: Literal["path", "bytes"] = "path",
+        keep_null: bool = False,
+    ) -> dict[str, dict[str, list[Any]]]:
+        suffix = "_path" if kind == "path" else "_bytes"
+        cols = sorted(c for c in self._frame.columns if c.startswith("image_") and c.endswith(suffix))
+        out: dict[str, dict[str, list[Any]]] = {"rgb": {}, "depth": {}, "other": {}}
+        for col in cols:
+            vals = self._frame[col].to_list()
+            if not keep_null:
+                vals = [v for v in vals if v is not None]
+            if col.startswith("image_rgb"):
+                out["rgb"][col] = vals
+            elif col.startswith("image_depth"):
+                out["depth"][col] = vals
+            else:
+                out["other"][col] = vals
         return out
 
     def alignment(self) -> dict[str, object]:
@@ -52,8 +75,7 @@ class Trajectory:
             "num_frames": int(self._frame.height),
             "has_state_vec": "state_vec" in self._frame.columns,
             "has_action_vec": "action_vec" in self._frame.columns,
-            "has_image_0_path": "image_0_path" in self._frame.columns,
-            "has_image_1_path": "image_1_path" in self._frame.columns,
+            "has_images": any(c.startswith("image_") and c.endswith("_path") for c in self._frame.columns),
             "missing_timestamps": int(self._frame["t"].null_count()),
             "duplicate_frame_ids": int(self._frame.height - self._frame["frame_id"].n_unique()),
             "is_monotonic_t": bool(np.all(np.diff(np.array(self._times, dtype=float)) >= 0.0)) if len(self._times) > 1 else True,
@@ -62,7 +84,7 @@ class Trajectory:
             out["missing_state_rows"] = int(self._frame["state_vec"].null_count())
         if "action_vec" in self._frame.columns:
             out["missing_action_rows"] = int(self._frame["action_vec"].null_count())
-        for col in ("image_0_path", "image_1_path"):
+        for col in sorted(c for c in self._frame.columns if c.startswith("image_") and c.endswith("_path")):
             if col in self._frame.columns:
                 out[f"missing_{col}_rows"] = int(self._frame[col].null_count())
         return out
@@ -74,17 +96,27 @@ class Trajectory:
         frame_id: int | None = None,
         t: float | None = None,
     ) -> FrameRecord:
+        row_idx = self._resolve_row_idx(idx=idx, frame_id=frame_id, t=t)
+        row = self._frame.row(row_idx, named=True)
+        return FrameRecord(
+            trajectory_id=str(row["trajectory_id"]),
+            frame_id=int(row["frame_id"]),
+            t=float(row["t"]),
+            values=row,
+        )
+
+    def _resolve_row_idx(self, *, idx: int | None = None, frame_id: int | None = None, t: float | None = None) -> int:
         provided = [idx is not None, frame_id is not None, t is not None]
         if sum(provided) != 1:
             raise ValueError("provide exactly one of idx, frame_id, or t")
         if idx is not None:
             if idx < 0 or idx >= self._frame.height:
                 raise IndexError(f"idx {idx} out of range for trajectory {self.id}")
-            row_idx = idx
+            return idx
         elif frame_id is not None:
             if frame_id not in self._frame_id_to_row:
                 raise KeyError(f"frame_id {frame_id} not found in trajectory {self.id}")
-            row_idx = self._frame_id_to_row[frame_id]
+            return self._frame_id_to_row[frame_id]
         else:
             assert t is not None
             row_idx = bisect.bisect_left(self._times, float(t))
@@ -95,14 +127,82 @@ class Trajectory:
                 right = abs(self._times[row_idx] - float(t))
                 if left <= right:
                     row_idx = row_idx - 1
+            return row_idx
 
-        row = self._frame.row(row_idx, named=True)
-        return FrameRecord(
-            trajectory_id=str(row["trajectory_id"]),
-            frame_id=int(row["frame_id"]),
-            t=float(row["t"]),
-            values=row,
+    def get_image_ref(
+        self,
+        *,
+        idx: int | None = None,
+        frame_id: int | None = None,
+        t: float | None = None,
+        camera: int = 0,
+        kind: Literal["auto", "path", "bytes"] = "auto",
+        modality: Literal["rgb", "depth", "other", "any"] = "any",
+    ) -> Any:
+        row_idx = self._resolve_row_idx(idx=idx, frame_id=frame_id, t=t)
+        source_order = ["bytes", "path"] if kind == "auto" else [kind]
+
+        for source in source_order:
+            suffix = "_path" if source == "path" else "_bytes"
+            cols = [c for c in self._frame.columns if c.startswith("image_") and c.endswith(suffix)]
+            if modality != "any":
+                if modality == "other":
+                    cols = [c for c in cols if not c.startswith("image_rgb") and not c.startswith("image_depth")]
+                else:
+                    prefix = "image_rgb" if modality == "rgb" else "image_depth"
+                    cols = [c for c in cols if c.startswith(prefix)]
+            cols = sorted(cols)
+            if not cols:
+                continue
+
+            # First try requested camera index in this source.
+            if 0 <= camera < len(cols):
+                val = self._frame[cols[camera]][row_idx]
+                if val is not None:
+                    return val
+
+            # Auto fallback: first non-null in this source/modality.
+            for col in cols:
+                val = self._frame[col][row_idx]
+                if val is not None:
+                    return val
+
+        raise KeyError(
+            f"no image found for kind={kind!r}, modality={modality!r} at row={row_idx}; "
+            f"available image cols={[c for c in self._frame.columns if c.startswith('image_')]}"
         )
+
+    def get_image(
+        self,
+        *,
+        idx: int | None = None,
+        frame_id: int | None = None,
+        t: float | None = None,
+        camera: int = 0,
+        modality: Literal["rgb", "depth", "other", "any"] = "any",
+        source: Literal["auto", "bytes", "path"] = "auto",
+        decode: bool = True,
+    ) -> Any:
+        ref = self.get_image_ref(
+            idx=idx,
+            frame_id=frame_id,
+            t=t,
+            camera=camera,
+            kind=source,
+            modality=modality,
+        )
+        if not decode:
+            return ref
+        if source == "path":
+            import matplotlib.image as mpimg
+
+            return mpimg.imread(ref)
+
+        if isinstance(ref, (bytes, bytearray, memoryview)):
+            import matplotlib.image as mpimg
+
+            return mpimg.imread(BytesIO(bytes(ref)))
+        raise TypeError(f"expected bytes-like image data, got {type(ref)!r}")
 
     def frame_view(
         self,

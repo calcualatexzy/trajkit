@@ -1,46 +1,37 @@
-"""Local smoke + speed check for trajkit."""
+"""Minimal demo: load, analyze, show one image."""
 
-from __future__ import annotations
-
-import time
-
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+import matplotlib.pyplot as plt
 
 from trajkit import TrajectoryDataset
 
 
-def run() -> None:
-    lerobot_dataset = LeRobotDataset("lerobot/libero")
+demo_path = "data/hf_vla/openx_bridge_v2_subset.parquet"
+ds = TrajectoryDataset.load(demo_path, include_images="bytes")
 
-    for image_mode in ("none", "paths"):
-        t0 = time.perf_counter()
-        ds = TrajectoryDataset.load(lerobot_dataset, include_images=image_mode)
-        load_dt = time.perf_counter() - t0
+summary = ds.summary()
+print("num_trajectories:", summary.get("num_trajectories"))
+print("num_points:", summary.get("num_points"))
+print("feature rows:", ds.feature_table().height)
+print("top outlier:", ds.find_outliers(top_k=1))
 
-        t1 = time.perf_counter()
-        summary = ds.summary()
-        summary_dt = time.perf_counter() - t1
+traj = ds[0]
+f0 = traj.get_frame(idx=0)
+print("frame0:", {"trajectory_id": f0.trajectory_id, "frame_id": f0.frame_id, "t": f0.t})
 
-        t2 = time.perf_counter()
-        _ = ds[0].frame_view(start=0, stop=128, step=2)
-        frame_view_dt = time.perf_counter() - t2
+channels = traj.image_channels(kind="bytes")
+print("image channel columns:", {k: list(v.keys()) for k, v in channels.items()})
 
-        print(
-            {
-                "image_mode": image_mode,
-                "load_sec": round(load_dt, 3),
-                "summary_sec": round(summary_dt, 3),
-                "frame_view_sec": round(frame_view_dt, 3),
-                "loader_mode": summary.get("loader_mode"),
-                "has_images": summary.get("modalities", {}).get("has_images"),
-                "num_trajectories": summary.get("num_trajectories"),
-                "num_points": summary.get("num_points"),
-            }
-        )
+try:
+    img = traj.get_image(idx=0, modality="rgb", decode=True)  # source auto: bytes -> path fallback
+except Exception:
+    img = None
 
-    file_ds = TrajectoryDataset.load("data/hf_vla/libero/file-000.parquet")
-    print({"file_summary": file_ds.summary()})
-
-
-if __name__ == "__main__":
-    run()
+if img is None:
+    print("no image bytes found")
+else:
+    plt.figure(figsize=(4, 4))
+    plt.imshow(img)
+    plt.title("First trajectory image")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.show()

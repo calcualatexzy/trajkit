@@ -154,6 +154,9 @@ def _sample_to_row(
             _nested(sample, "observation", "images", "image2"),
             _nested(sample, "observation", "image2"),
         )
+        _write_image_fields(row, "image_rgb", image0, include_images=include_images)
+        _write_image_fields(row, "image_depth", image1, include_images=include_images)
+        # Legacy aliases for backwards compatibility.
         _write_image_fields(row, "image_0", image0, include_images=include_images)
         _write_image_fields(row, "image_1", image1, include_images=include_images)
     return row
@@ -289,21 +292,36 @@ def _attach_video_path_refs(frame: pl.LazyFrame, dataset: Any) -> pl.LazyFrame:
         if episode_index is None:
             continue
         row: dict[str, Any] = {"episode_index": int(episode_index)}
-        for cam_idx, video_key in enumerate(video_keys[:2]):
+        rgb_idx = 0
+        depth_idx = 0
+        for cam_idx, video_key in enumerate(video_keys):
             try:
                 rel_path = meta.get_video_file_path(int(episode_index), str(video_key))
             except Exception:
                 continue
             if rel_path is None:
                 continue
-            row[f"image_{cam_idx}_path"] = str(root / rel_path)
+            full = str(root / rel_path)
+            row[f"image_{cam_idx}_path"] = full
+            if _is_depth_key(str(video_key)):
+                row[f"image_depth_{depth_idx}_path"] = full
+                if depth_idx == 0:
+                    row["image_depth_path"] = full
+                    row["image_1_path"] = full
+                depth_idx += 1
+            else:
+                row[f"image_rgb_{rgb_idx}_path"] = full
+                if rgb_idx == 0:
+                    row["image_rgb_path"] = full
+                    row["image_0_path"] = full
+                rgb_idx += 1
         rows.append(row)
 
     if not rows:
         return frame
 
     refs = pl.DataFrame(rows).lazy()
-    existing_cols = [c for c in ("image_0_path", "image_1_path") if c in names]
+    existing_cols = [c for c in names if c.startswith("image_") and c.endswith("_path")]
     out = frame.join(refs, on="episode_index", how="left", suffix="_meta")
     if not existing_cols:
         return out
@@ -329,3 +347,7 @@ def _video_meta_keys(dataset: Any) -> list[str]:
     if not isinstance(keys, Sequence):
         return []
     return [str(k) for k in keys if isinstance(k, str) and k]
+
+
+def _is_depth_key(name: str) -> bool:
+    return "depth" in name.lower()

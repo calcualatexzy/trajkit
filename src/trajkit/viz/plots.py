@@ -96,7 +96,8 @@ def plot_cluster_embedding(feature_frame: pl.DataFrame, labels: dict[str, int], 
 def plot_modality_coverage(frame: pl.DataFrame, ax=None):
     import matplotlib.pyplot as plt
 
-    cols = [c for c in ("state_vec", "action_vec", "image_0_path", "image_1_path") if c in frame.columns]
+    image_cols = [c for c in frame.columns if c.startswith("image_") and (c.endswith("_path") or c.endswith("_bytes"))]
+    cols = [c for c in ("state_vec", "action_vec") if c in frame.columns] + sorted(image_cols)
     if not cols:
         raise ValueError("no modality columns found")
     use_ax = ax if ax is not None else plt.subplots(figsize=(6, 4))[1]

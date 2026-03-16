@@ -210,16 +210,21 @@ def _describe(values: np.ndarray) -> dict[str, float]:
 
 
 def _modality_stats(lf: pl.LazyFrame, schema_names: list[str], total_points: int) -> dict[str, object]:
+    image_cols = [
+        col
+        for col in schema_names
+        if col.startswith("image_") and (col.endswith("_path") or col.endswith("_bytes"))
+    ]
     out: dict[str, object] = {
         "has_states": "state_vec" in schema_names,
         "has_actions": "action_vec" in schema_names,
-        "has_images": any(col in schema_names for col in ("image_0_path", "image_1_path", "image_0_bytes", "image_1_bytes")),
+        "has_images": bool(image_cols),
     }
     if total_points <= 0:
         return out
 
     coverage_exprs: list[pl.Expr] = []
-    for col in ("state_vec", "action_vec", "image_0_path", "image_1_path"):
+    for col in ("state_vec", "action_vec", *image_cols):
         if col in schema_names:
             coverage_exprs.append((1.0 - pl.col(col).null_count() / pl.len()).alias(f"{col}_coverage"))
     if coverage_exprs:

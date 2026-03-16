@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal
 
 import numpy as np
 import polars as pl
@@ -12,7 +13,7 @@ from trajkit.utils.typing import PathLike
 from trajkit.utils.validation import ensure_required_columns
 
 ImageMode = Literal["none", "paths", "bytes"]
-SUPPORTED_EXTENSIONS = (".parquet", ".csv", ".json", ".jsonl", ".npy", ".npz")
+SUPPORTED_EXTENSIONS = (".parquet", ".csv", ".json", ".jsonl", ".npy", ".npz", ".hdf5", ".h5", ".rlds")
 CANONICAL_ALIASES: dict[str, tuple[str, ...]] = {
     "t": ("t", "timestamp", "time", "ts"),
     "x": ("x", "tx", "pos_x", "position_x"),
@@ -28,12 +29,7 @@ def load_dataset(
     include_actions: bool = True,
     include_images: ImageMode = "paths",
 ) -> pl.DataFrame:
-    return load_dataset_lazy(
-        path=path,
-        include_states=include_states,
-        include_actions=include_actions,
-        include_images=include_images,
-    ).collect()
+    return load_dataset_lazy(path, include_states=include_states, include_actions=include_actions, include_images=include_images).collect()
 
 
 def load_dataset_lazy(
@@ -42,41 +38,47 @@ def load_dataset_lazy(
     include_actions: bool = True,
     include_images: ImageMode = "paths",
 ) -> pl.LazyFrame:
-    path = Path(path)
-    files = list(_discover_files(path))
+    files = list(_discover_files(Path(path)))
     if not files:
         raise FileNotFoundError(f"no supported files under {path}")
 
     frames: list[pl.LazyFrame] = []
     for file in files:
         try:
-            frame = _normalize_table_lazy(
-                frame=_load_single_file_lazy(file),
-                default_trajectory_id=file.stem,
+            loaded = _load_single_file_lazy(
+                file,
                 include_states=include_states,
                 include_actions=include_actions,
                 include_images=include_images,
             )
+            frames.append(
+                _normalize_table_lazy(
+                    loaded,
+                    default_trajectory_id=file.stem,
+                    include_states=include_states,
+                    include_actions=include_actions,
+                    include_images=include_images,
+                )
+            )
         except ValueError:
-            # Skip metadata blobs (e.g. task jsonl) that are not step tables.
             continue
-        frames.append(frame)
     if not frames:
         raise ValueError(f"no trajectory tables discovered under {path}")
+
     frame = pl.concat(frames, how="diagonal_relaxed")
-    cast_exprs: list[pl.Expr] = [
+    names = set(_schema_names(frame))
+    casts: list[pl.Expr] = [
         pl.col("trajectory_id").cast(pl.String),
         pl.col("t").cast(pl.Float64),
         pl.col("x").cast(pl.Float64),
         pl.col("y").cast(pl.Float64),
         pl.col("z").cast(pl.Float64),
     ]
-    names = frame.collect_schema().names()
     if "state_vec" in names:
-        cast_exprs.append(pl.col("state_vec").cast(pl.List(pl.Float64)))
+        casts.append(pl.col("state_vec").cast(pl.List(pl.Float64)))
     if "action_vec" in names:
-        cast_exprs.append(pl.col("action_vec").cast(pl.List(pl.Float64)))
-    return frame.with_columns(cast_exprs)
+        casts.append(pl.col("action_vec").cast(pl.List(pl.Float64)))
+    return frame.with_columns(casts)
 
 
 def _discover_files(path: Path) -> Iterable[Path]:
@@ -90,44 +92,266 @@ def _discover_files(path: Path) -> Iterable[Path]:
                 yield f
 
 
-def _load_single_file_lazy(path: Path) -> pl.LazyFrame:
+def _load_single_file_lazy(
+    path: Path,
+    *,
+    include_states: bool,
+    include_actions: bool,
+    include_images: ImageMode,
+) -> pl.LazyFrame:
     suffix = path.suffix.lower()
     if suffix == ".parquet":
         return pl.scan_parquet(path)
     if suffix == ".csv":
         return pl.scan_csv(path)
     if suffix in (".json", ".jsonl"):
-        if suffix == ".jsonl":
-            return pl.scan_ndjson(path)
-        return pl.read_json(path).lazy()
+        return pl.scan_ndjson(path) if suffix == ".jsonl" else pl.read_json(path).lazy()
     if suffix in (".npy", ".npz"):
         return _load_numpy(path).lazy()
+    if suffix in (".hdf5", ".h5"):
+        return _load_hdf5(path, include_states=include_states, include_actions=include_actions, include_images=include_images).lazy()
+    if suffix == ".rlds":
+        return _load_rlds(path, include_states=include_states, include_actions=include_actions, include_images=include_images).lazy()
     raise ValueError(f"unsupported file extension: {suffix}")
 
 
 def _load_numpy(path: Path) -> pl.DataFrame:
     if path.suffix.lower() == ".npy":
-        arr = np.load(path)
-        return _nparray_to_frame(arr)
+        return _nparray_to_frame(np.load(path))
     data = np.load(path)
-    if "arr_0" in data:
-        return _nparray_to_frame(data["arr_0"])
-    keys = list(data.keys())
-    if not keys:
+    key = "arr_0" if "arr_0" in data else (list(data.keys())[0] if data.keys() else None)
+    if key is None:
         raise ValueError(f"empty npz file: {path}")
-    return _nparray_to_frame(data[keys[0]])
+    return _nparray_to_frame(data[key])
 
 
 def _nparray_to_frame(arr: np.ndarray) -> pl.DataFrame:
     if arr.ndim != 2 or arr.shape[1] < 2:
         raise ValueError("expected ndarray of shape (n, d>=2)")
     if arr.shape[1] == 2:
-        cols = {"x": arr[:, 0], "y": arr[:, 1]}
-    elif arr.shape[1] == 3:
-        cols = {"t": arr[:, 0], "x": arr[:, 1], "y": arr[:, 2]}
-    else:
-        cols = {"t": arr[:, 0], "x": arr[:, 1], "y": arr[:, 2], "z": arr[:, 3]}
-    return pl.DataFrame(cols)
+        return pl.DataFrame({"x": arr[:, 0], "y": arr[:, 1]})
+    if arr.shape[1] == 3:
+        return pl.DataFrame({"t": arr[:, 0], "x": arr[:, 1], "y": arr[:, 2]})
+    return pl.DataFrame({"t": arr[:, 0], "x": arr[:, 1], "y": arr[:, 2], "z": arr[:, 3]})
+
+
+def _load_hdf5(path: Path, *, include_states: bool, include_actions: bool, include_images: ImageMode) -> pl.DataFrame:
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ValueError("loading .hdf5/.h5 requires h5py") from exc
+
+    def group_to_frame(group: Any, trajectory_id: str) -> pl.DataFrame | None:
+        t = _h5_get_array(group, "t", "timestamp", "time")
+        x = _h5_get_array(group, "x", "position/x", "pos/x")
+        y = _h5_get_array(group, "y", "position/y", "pos/y")
+        z = _h5_get_array(group, "z", "position/z", "pos/z")
+
+        state = _h5_get_array(group, "state_vec", "observation/state", "observation.state", "state") if include_states else None
+        action = _h5_get_array(group, "action_vec", "action", "actions") if include_actions else None
+
+        n = _first_nonzero_len(t, x, y, z, state, action)
+        if n <= 0:
+            return None
+        if t is None:
+            t = np.arange(n, dtype=np.float64)
+
+        if (x is None or y is None) and state is not None and state.ndim == 2 and state.shape[1] >= 2:
+            x = state[:, 0]
+            y = state[:, 1]
+            z = state[:, 2] if state.shape[1] >= 3 else np.zeros(n, dtype=np.float64)
+        if x is None or y is None:
+            return None
+        if z is None:
+            z = np.zeros(n, dtype=np.float64)
+
+        cols: dict[str, object] = {
+            "trajectory_id": np.full(n, str(trajectory_id), dtype=object),
+            "frame_index": np.arange(n, dtype=np.int64),
+            "t": np.asarray(t).reshape(-1)[:n],
+            "x": np.asarray(x).reshape(-1)[:n],
+            "y": np.asarray(y).reshape(-1)[:n],
+            "z": np.asarray(z).reshape(-1)[:n],
+        }
+        if include_states and state is not None and state.ndim == 2:
+            cols["state_vec"] = np.asarray(state[:n], dtype=np.float64).tolist()
+        if include_actions and action is not None and action.ndim == 2:
+            cols["action_vec"] = np.asarray(action[:n], dtype=np.float64).tolist()
+
+        if include_images != "none":
+            rgb_path = _h5_get_array(group, "image_rgb_path", "image/path", "rgb/path")
+            depth_path = _h5_get_array(group, "image_depth_path", "depth/path")
+            if rgb_path is not None:
+                vals = _decode_h5_strings(rgb_path)[:n]
+                cols["image_rgb_path"] = vals
+                cols["image_0_path"] = vals
+            if depth_path is not None:
+                vals = _decode_h5_strings(depth_path)[:n]
+                cols["image_depth_path"] = vals
+                cols["image_1_path"] = vals
+            if include_images == "bytes":
+                rgb_bytes = _h5_get_array(group, "image_rgb_bytes", "image/bytes", "rgb/bytes")
+                depth_bytes = _h5_get_array(group, "image_depth_bytes", "depth/bytes")
+                if rgb_bytes is not None:
+                    vals = [bytes(v) if v is not None else None for v in rgb_bytes[:n]]
+                    cols["image_rgb_bytes"] = vals
+                    cols["image_0_bytes"] = vals
+                if depth_bytes is not None:
+                    vals = [bytes(v) if v is not None else None for v in depth_bytes[:n]]
+                    cols["image_depth_bytes"] = vals
+                    cols["image_1_bytes"] = vals
+        return pl.DataFrame(cols)
+
+    with h5py.File(path, "r") as h5:
+        root = group_to_frame(h5, trajectory_id=path.stem)
+        if root is not None:
+            return root
+        parts: list[pl.DataFrame] = []
+        for key in sorted(h5.keys()):
+            obj = h5.get(key)
+            if obj is None or not hasattr(obj, "keys"):
+                continue
+            part = group_to_frame(obj, trajectory_id=key)
+            if part is not None and not part.is_empty():
+                parts.append(part)
+        if not parts:
+            raise ValueError(f"no trajectory table discovered in hdf5 file: {path}")
+        return pl.concat(parts, how="diagonal_relaxed")
+
+
+def _load_rlds(path: Path, *, include_states: bool, include_actions: bool, include_images: ImageMode) -> pl.DataFrame:
+    batch_size = 4096
+    frames: list[pl.DataFrame] = []
+    rows: list[dict[str, object]] = []
+
+    def flush() -> None:
+        nonlocal rows
+        if rows:
+            frames.append(pl.DataFrame(rows))
+            rows = []
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            if not isinstance(item, dict):
+                continue
+            ep = str(item.get("episode_id", item.get("episode_idx", item.get("trajectory_id", "0"))))
+
+            if isinstance(item.get("steps"), list):
+                for i, step in enumerate(item["steps"]):
+                    if not isinstance(step, dict):
+                        continue
+                    row = _rlds_step_to_row(
+                        step,
+                        trajectory_id=ep,
+                        frame_index=i,
+                        include_states=include_states,
+                        include_actions=include_actions,
+                        include_images=include_images,
+                    )
+                    if row is not None:
+                        rows.append(row)
+            else:
+                idx = int(item.get("frame_index", item.get("step_idx", 0)))
+                row = _rlds_step_to_row(
+                    item,
+                    trajectory_id=ep,
+                    frame_index=idx,
+                    include_states=include_states,
+                    include_actions=include_actions,
+                    include_images=include_images,
+                )
+                if row is not None:
+                    rows.append(row)
+            if len(rows) >= batch_size:
+                flush()
+    flush()
+    if not frames:
+        raise ValueError(f"no rows parsed from rlds file: {path}")
+    return pl.concat(frames, how="diagonal_relaxed")
+
+
+def _rlds_step_to_row(
+    step: dict[str, object],
+    *,
+    trajectory_id: str,
+    frame_index: int,
+    include_states: bool,
+    include_actions: bool,
+    include_images: ImageMode,
+) -> dict[str, object] | None:
+    state = step.get("state_vec")
+    action = step.get("action_vec")
+    x = step.get("x")
+    y = step.get("y")
+    z = step.get("z", 0.0)
+    if (x is None or y is None) and isinstance(state, list) and len(state) >= 2:
+        x, y = state[0], state[1]
+        z = state[2] if len(state) >= 3 else 0.0
+    if x is None or y is None:
+        return None
+
+    row: dict[str, object] = {
+        "trajectory_id": trajectory_id,
+        "frame_index": int(frame_index),
+        "t": float(step.get("timestamp", step.get("t", float(frame_index)))),
+        "x": float(x),
+        "y": float(y),
+        "z": float(z),
+    }
+    if include_states and isinstance(state, list):
+        row["state_vec"] = [float(v) for v in state]
+    if include_actions and isinstance(action, list):
+        row["action_vec"] = [float(v) for v in action]
+    if include_images != "none":
+        rgb = step.get("image_rgb_path")
+        depth = step.get("image_depth_path")
+        if isinstance(rgb, str):
+            row["image_rgb_path"] = rgb
+            row["image_0_path"] = rgb
+        if isinstance(depth, str):
+            row["image_depth_path"] = depth
+            row["image_1_path"] = depth
+    return row
+
+
+def _h5_get_array(group: Any, *keys: str) -> np.ndarray | None:
+    for key in keys:
+        cur = group
+        ok = True
+        for part in key.split("/"):
+            if not hasattr(cur, "__contains__") or part not in cur:
+                ok = False
+                break
+            cur = cur[part]
+        if ok and hasattr(cur, "shape"):
+            try:
+                return np.asarray(cur)
+            except Exception:
+                pass
+    return None
+
+
+def _first_nonzero_len(*arrs: np.ndarray | None) -> int:
+    for arr in arrs:
+        if arr is not None and getattr(arr, "ndim", 0) > 0 and arr.shape[0] > 0:
+            return int(arr.shape[0])
+    return 0
+
+
+def _decode_h5_strings(arr: np.ndarray) -> list[str | None]:
+    out: list[str | None] = []
+    for v in arr:
+        if v is None:
+            out.append(None)
+        elif isinstance(v, bytes):
+            out.append(v.decode("utf-8", errors="ignore"))
+        else:
+            out.append(str(v))
+    return out
 
 
 def _normalize_table_lazy(
@@ -137,10 +361,9 @@ def _normalize_table_lazy(
     include_actions: bool,
     include_images: ImageMode,
 ) -> pl.LazyFrame:
-    out = frame
-    out = _extract_vla_modalities(out, include_states=include_states, include_actions=include_actions, include_images=include_images)
+    out = _extract_vla_modalities(frame, include_states=include_states, include_actions=include_actions, include_images=include_images)
     out = _rename_aliases_lazy(out)
-    names = set(out.collect_schema().names())
+    names = set(_schema_names(out))
 
     if "trajectory_id" not in names:
         out = out.with_columns(pl.lit(default_trajectory_id).alias("trajectory_id"))
@@ -149,7 +372,6 @@ def _normalize_table_lazy(
         out = out.with_row_count(name="t", offset=0)
         names.add("t")
 
-    # Recover spatial proxies from state vectors if x/y/z are absent.
     if ("x" not in names or "y" not in names) and "state_vec" in names:
         out = out.with_columns(
             pl.col("state_vec").list.get(0).alias("x"),
@@ -166,43 +388,50 @@ def _normalize_table_lazy(
     if "frame_index" in names:
         out = out.with_columns(pl.col("frame_index").cast(pl.Int64).alias("frame_id"))
     else:
-        # Canonical frame id for fast frame-level retrieval.
         out = out.sort(["trajectory_id", "t"]).with_columns(pl.int_range(0, pl.len()).over("trajectory_id").alias("frame_id"))
 
-    ensure_required_columns(tuple(out.collect_schema().names()))
-
+    ensure_required_columns(tuple(_schema_names(out)))
+    current = set(_schema_names(out))
     keep = ["trajectory_id", "frame_id", "t", "x", "y", "z"]
-    optional_order = [
+    prefer = [
         "state_vec",
         "action_vec",
         "frame_index",
         "episode_index",
         "task_index",
         "label",
+        "image_rgb_path",
+        "image_depth_path",
+        "image_rgb_bytes",
+        "image_depth_bytes",
         "image_0_path",
         "image_1_path",
         "image_0_bytes",
         "image_1_bytes",
     ]
-    current = set(out.collect_schema().names())
-    keep.extend([col for col in optional_order if col in current])
-    out = out.select(keep)
-    return _canonicalize_types(out)
+    keep.extend([c for c in prefer if c in current])
+    keep.extend(
+        [
+            c
+            for c in sorted(current)
+            if c.startswith("image_") and (c.endswith("_path") or c.endswith("_bytes")) and c not in keep
+        ]
+    )
+    return _canonicalize_types(out.select(keep))
 
 
 def _rename_aliases_lazy(frame: pl.LazyFrame) -> pl.LazyFrame:
-    out = frame
-    current = set(out.collect_schema().names())
+    names = set(_schema_names(frame))
     rename_map: dict[str, str] = {}
     for canonical, aliases in CANONICAL_ALIASES.items():
-        if canonical in current:
+        if canonical in names:
             continue
         for alias in aliases:
-            if alias in current:
+            if alias in names:
                 rename_map[alias] = canonical
-                current.add(canonical)
+                names.add(canonical)
                 break
-    return out.rename(rename_map) if rename_map else out
+    return frame.rename(rename_map) if rename_map else frame
 
 
 def _extract_vla_modalities(
@@ -211,11 +440,11 @@ def _extract_vla_modalities(
     include_actions: bool,
     include_images: ImageMode,
 ) -> pl.LazyFrame:
-    names = set(frame.collect_schema().names())
+    names = set(_schema_names(frame))
     exprs: list[pl.Expr] = []
 
-    # Bridge-like nested struct format.
-    if {"state", "episode_idx"}.issubset(names):
+    is_bridge = {"state", "episode_idx"}.issubset(names)
+    if is_bridge:
         exprs.extend(
             [
                 pl.col("episode_idx").cast(pl.String).alias("trajectory_id"),
@@ -252,72 +481,97 @@ def _extract_vla_modalities(
                     ]
                 ).alias("action_vec")
             )
-
-    # LeRobot parquet format (libero/community).
-    if "episode_index" in names:
-        exprs.append(pl.col("episode_index").cast(pl.String).alias("trajectory_id"))
-    if "timestamp" in names:
-        exprs.append(pl.col("timestamp").cast(pl.Float64).alias("t"))
-    if include_states and "observation.state" in names:
-        exprs.append(pl.col("observation.state").cast(pl.List(pl.Float64)).alias("state_vec"))
-    if include_actions and "action" in names:
-        exprs.append(pl.col("action").cast(pl.List(pl.Float64)).alias("action_vec"))
-
-    # Try spatial recovery from observation state vector (x/y/z are first 3 entries for many VLA datasets).
-    if "observation.state" in names:
-        state_list = pl.col("observation.state").cast(pl.List(pl.Float64))
-        exprs.extend(
-            [
-                state_list.list.get(0).alias("x"),
-                state_list.list.get(1).alias("y"),
-                state_list.list.get(2).fill_null(0.0).alias("z"),
-            ]
-        )
+    else:
+        if "episode_index" in names:
+            exprs.append(pl.col("episode_index").cast(pl.String).alias("trajectory_id"))
+        if "timestamp" in names:
+            exprs.append(pl.col("timestamp").cast(pl.Float64).alias("t"))
+        if include_states and "observation.state" in names:
+            exprs.append(pl.col("observation.state").cast(pl.List(pl.Float64)).alias("state_vec"))
+        if include_actions and "action" in names:
+            exprs.append(pl.col("action").cast(pl.List(pl.Float64)).alias("action_vec"))
+        if "observation.state" in names:
+            s = pl.col("observation.state").cast(pl.List(pl.Float64))
+            exprs.extend([s.list.get(0).alias("x"), s.list.get(1).alias("y"), s.list.get(2).fill_null(0.0).alias("z")])
 
     if include_images != "none":
         image_specs = [
-            ("observation.images.image", "image_0"),
-            ("observation.images.image2", "image_1"),
-            ("observation.image", "image_0"),
-            ("observation.image2", "image_1"),
-            ("image", "image_0"),
+            ("observation.images.rgb", "rgb"),
+            ("observation.rgb", "rgb"),
+            ("observation.images.image", "rgb"),
+            ("observation.image", "rgb"),
+            ("image", "rgb"),
+            ("rgb", "rgb"),
+            ("observation.images.image2", "rgb"),
+            ("observation.image2", "rgb"),
+            ("image2", "rgb"),
+            ("observation.images.depth", "depth"),
+            ("observation.depth", "depth"),
+            ("observation.images.image_depth", "depth"),
+            ("observation.image_depth", "depth"),
+            ("depth", "depth"),
         ]
-        for source, target in image_specs:
-            if source in names:
-                exprs.append(pl.col(source).struct.field("path").alias(f"{target}_path"))
-                if include_images == "bytes":
-                    exprs.append(pl.col(source).struct.field("bytes").alias(f"{target}_bytes"))
+        rgb_i, depth_i, cam_i = 0, 0, 0
+        for source, kind in image_specs:
+            if source not in names:
+                continue
+            path_expr = pl.col(source).struct.field("path")
+            exprs.append(path_expr.alias(f"image_{cam_i}_path"))
+            if include_images == "bytes":
+                bytes_expr = pl.col(source).struct.field("bytes")
+                exprs.append(bytes_expr.alias(f"image_{cam_i}_bytes"))
 
-    passthrough = [col for col in ("frame_index", "episode_index", "task_index", "label") if col in names]
-    exprs.extend(pl.col(col) for col in passthrough)
+            if kind == "depth":
+                exprs.append(path_expr.alias(f"image_depth_{depth_i}_path"))
+                if depth_i == 0:
+                    exprs.append(path_expr.alias("image_depth_path"))
+                if include_images == "bytes":
+                    exprs.append(bytes_expr.alias(f"image_depth_{depth_i}_bytes"))
+                    if depth_i == 0:
+                        exprs.append(bytes_expr.alias("image_depth_bytes"))
+                depth_i += 1
+            else:
+                exprs.append(path_expr.alias(f"image_rgb_{rgb_i}_path"))
+                if rgb_i == 0:
+                    exprs.append(path_expr.alias("image_rgb_path"))
+                if include_images == "bytes":
+                    exprs.append(bytes_expr.alias(f"image_rgb_{rgb_i}_bytes"))
+                    if rgb_i == 0:
+                        exprs.append(bytes_expr.alias("image_rgb_bytes"))
+                rgb_i += 1
+            cam_i += 1
+
+    exprs.extend(pl.col(c) for c in ("frame_index", "episode_index", "task_index", "label") if c in names)
     return frame.with_columns(exprs) if exprs else frame
 
 
 def _canonicalize_types(frame: pl.LazyFrame) -> pl.LazyFrame:
-    names = set(frame.collect_schema().names())
+    names = set(_schema_names(frame))
     casts: list[pl.Expr] = []
 
-    def maybe_cast(col: str, dtype: pl.DataType) -> None:
+    def maybe(col: str, dtype: pl.DataType) -> None:
         if col in names:
             casts.append(pl.col(col).cast(dtype, strict=False).alias(col))
 
-    maybe_cast("trajectory_id", pl.String)
-    maybe_cast("frame_id", pl.Int64)
-    maybe_cast("t", pl.Float64)
-    maybe_cast("x", pl.Float64)
-    maybe_cast("y", pl.Float64)
-    maybe_cast("z", pl.Float64)
-    maybe_cast("frame_index", pl.Int64)
-    maybe_cast("episode_index", pl.Int64)
-    maybe_cast("task_index", pl.Int64)
-    maybe_cast("label", pl.String)
-    maybe_cast("state_vec", pl.List(pl.Float64))
-    maybe_cast("action_vec", pl.List(pl.Float64))
-    maybe_cast("image_0_path", pl.String)
-    maybe_cast("image_1_path", pl.String)
-    maybe_cast("image_0_bytes", pl.Binary)
-    maybe_cast("image_1_bytes", pl.Binary)
+    maybe("trajectory_id", pl.String)
+    maybe("frame_id", pl.Int64)
+    maybe("frame_index", pl.Int64)
+    maybe("episode_index", pl.Int64)
+    maybe("task_index", pl.Int64)
+    maybe("label", pl.String)
+    maybe("t", pl.Float64)
+    maybe("x", pl.Float64)
+    maybe("y", pl.Float64)
+    maybe("z", pl.Float64)
+    maybe("state_vec", pl.List(pl.Float64))
+    maybe("action_vec", pl.List(pl.Float64))
+    for c in sorted(names):
+        if c.startswith("image_") and c.endswith("_path"):
+            maybe(c, pl.String)
+        if c.startswith("image_") and c.endswith("_bytes"):
+            maybe(c, pl.Binary)
+    return frame.with_columns(casts) if casts else frame
 
-    if not casts:
-        return frame
-    return frame.with_columns(casts)
+
+def _schema_names(frame: pl.LazyFrame) -> list[str]:
+    return frame.collect_schema().names()
