@@ -42,6 +42,8 @@ print(ds.summary())
 print(ds.feature_table().head())
 print(ds.cluster(k=4).medoid_ids)
 print(ds.find_outliers(top_k=5))
+# if force/torque exists, feature_table also includes:
+# mean_force_norm, max_force_norm, mean_torque_norm, max_torque_norm
 ```
 
 ## 5) Frame-level access
@@ -53,6 +55,7 @@ print(traj.frame_view(start=0, stop=64, step=2).x.shape)
 print(traj.image_channels(kind="path").keys())  # rgb/depth/other
 img = traj.get_image(idx=0, modality="rgb", decode=True)
 # img is a numpy array, ready for plt.imshow(img)
+print(traj.force_torque_vectors())  # None if dataset has no F/T
 ```
 
 `source` supports:

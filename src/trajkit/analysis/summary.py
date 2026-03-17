@@ -108,6 +108,37 @@ def per_trajectory_features(frame: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame:
         )
         .collect()
     )
+
+    if "wrench_vec" in lf.collect_schema().names():
+        wrench_feat = (
+            lf.select(["trajectory_id", "wrench_vec"])
+            .with_columns(
+                (
+                    pl.col("wrench_vec").list.get(0).pow(2)
+                    + pl.col("wrench_vec").list.get(1).pow(2)
+                    + pl.col("wrench_vec").list.get(2).pow(2)
+                )
+                .sqrt()
+                .alias("_force_norm"),
+                (
+                    pl.col("wrench_vec").list.get(3).pow(2)
+                    + pl.col("wrench_vec").list.get(4).pow(2)
+                    + pl.col("wrench_vec").list.get(5).pow(2)
+                )
+                .sqrt()
+                .alias("_torque_norm"),
+            )
+            .group_by("trajectory_id")
+            .agg(
+                pl.col("_force_norm").mean().alias("mean_force_norm"),
+                pl.col("_force_norm").max().alias("max_force_norm"),
+                pl.col("_torque_norm").mean().alias("mean_torque_norm"),
+                pl.col("_torque_norm").max().alias("max_torque_norm"),
+            )
+            .collect()
+        )
+        feat = feat.join(wrench_feat, on="trajectory_id", how="left")
+
     return feat
 
 
@@ -178,6 +209,16 @@ def summarize_dataset(frame: pl.DataFrame | pl.LazyFrame) -> dict[str, object]:
         "mean_speed": _describe(feat["mean_speed"].to_numpy()),
         "max_speed": _describe(feat["max_speed"].to_numpy()),
         "mean_acceleration": _describe(feat["mean_acceleration"].to_numpy()),
+        **(
+            {
+                "mean_force_norm": _describe(feat["mean_force_norm"].to_numpy()),
+                "max_force_norm": _describe(feat["max_force_norm"].to_numpy()),
+                "mean_torque_norm": _describe(feat["mean_torque_norm"].to_numpy()),
+                "max_torque_norm": _describe(feat["max_torque_norm"].to_numpy()),
+            }
+            if "mean_force_norm" in feat.columns
+            else {}
+        ),
         "sampling_rate_hz": _describe(sample_rate),
         "bounding_box": {
             "min_x": float(base["min_x"]),
@@ -218,13 +259,14 @@ def _modality_stats(lf: pl.LazyFrame, schema_names: list[str], total_points: int
     out: dict[str, object] = {
         "has_states": "state_vec" in schema_names,
         "has_actions": "action_vec" in schema_names,
+        "has_force_torque": "wrench_vec" in schema_names,
         "has_images": bool(image_cols),
     }
     if total_points <= 0:
         return out
 
     coverage_exprs: list[pl.Expr] = []
-    for col in ("state_vec", "action_vec", *image_cols):
+    for col in ("state_vec", "action_vec", "wrench_vec", *image_cols):
         if col in schema_names:
             coverage_exprs.append((1.0 - pl.col(col).null_count() / pl.len()).alias(f"{col}_coverage"))
     if coverage_exprs:

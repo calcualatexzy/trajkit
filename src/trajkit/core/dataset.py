@@ -274,7 +274,7 @@ class TrajectoryDataset:
     def plot_modality_coverage(self, ax=None):
         schema_names = self._lazy_frame.collect_schema().names()
         image_cols = [c for c in schema_names if c.startswith("image_") and (c.endswith("_path") or c.endswith("_bytes"))]
-        keep = [c for c in ("state_vec", "action_vec") if c in schema_names] + sorted(image_cols)
+        keep = [c for c in ("state_vec", "action_vec", "wrench_vec") if c in schema_names] + sorted(image_cols)
         frame = self._lazy_frame.select(keep).collect()
         return plot_modality_coverage(frame, ax=ax)
 

@@ -70,4 +70,21 @@ def trajectory_features(frame: pl.DataFrame) -> dict[str, float]:
         "curvature_proxy": curvature_proxy,
         "stop_ratio": stop_ratio,
         "straightness": straightness,
+        **_wrench_stats(ordered),
+    }
+
+
+def _wrench_stats(frame: pl.DataFrame) -> dict[str, float]:
+    if "wrench_vec" not in frame.columns:
+        return {}
+    wrench = np.asarray(frame["wrench_vec"].to_list(), dtype=float)
+    if wrench.ndim != 2 or wrench.shape[1] < 6:
+        return {}
+    force = np.linalg.norm(wrench[:, :3], axis=1)
+    torque = np.linalg.norm(wrench[:, 3:6], axis=1)
+    return {
+        "mean_force_norm": float(np.mean(force)) if force.size else 0.0,
+        "max_force_norm": float(np.max(force)) if force.size else 0.0,
+        "mean_torque_norm": float(np.mean(torque)) if torque.size else 0.0,
+        "max_torque_norm": float(np.max(torque)) if torque.size else 0.0,
     }

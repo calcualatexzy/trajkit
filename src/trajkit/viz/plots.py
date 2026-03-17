@@ -78,6 +78,10 @@ def plot_cluster_embedding(feature_frame: pl.DataFrame, labels: dict[str, int], 
     x = x - x.mean(axis=0, keepdims=True)
     u, s, _ = np.linalg.svd(x, full_matrices=False)
     emb = u[:, :2] * s[:2]
+    if emb.shape[1] == 1:
+        # Degenerate cases (e.g. tiny datasets) can yield only one SVD axis.
+        # Pad a zero second axis so downstream 2D scatter still works.
+        emb = np.hstack([emb, np.zeros((emb.shape[0], 1), dtype=emb.dtype)])
 
     use_ax = ax if ax is not None else plt.subplots(figsize=(7, 5))[1]
     label_vec = np.array([labels.get(str(tid), -1) for tid in ids], dtype=int)
@@ -97,7 +101,7 @@ def plot_modality_coverage(frame: pl.DataFrame, ax=None):
     import matplotlib.pyplot as plt
 
     image_cols = [c for c in frame.columns if c.startswith("image_") and (c.endswith("_path") or c.endswith("_bytes"))]
-    cols = [c for c in ("state_vec", "action_vec") if c in frame.columns] + sorted(image_cols)
+    cols = [c for c in ("state_vec", "action_vec", "wrench_vec") if c in frame.columns] + sorted(image_cols)
     if not cols:
         raise ValueError("no modality columns found")
     use_ax = ax if ax is not None else plt.subplots(figsize=(6, 4))[1]

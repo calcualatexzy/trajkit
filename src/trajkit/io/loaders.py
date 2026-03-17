@@ -15,10 +15,10 @@ from trajkit.utils.validation import ensure_required_columns
 ImageMode = Literal["none", "paths", "bytes"]
 SUPPORTED_EXTENSIONS = (".parquet", ".csv", ".json", ".jsonl", ".npy", ".npz", ".hdf5", ".h5", ".rlds")
 CANONICAL_ALIASES: dict[str, tuple[str, ...]] = {
-    "t": ("t", "timestamp", "time", "ts"),
-    "x": ("x", "tx", "pos_x", "position_x"),
-    "y": ("y", "ty", "pos_y", "position_y"),
-    "z": ("z", "tz", "pos_z", "position_z"),
+    "t": ("t", "timestamp", "time", "ts", "elapsed_s"),
+    "x": ("x", "tx", "pos_x", "position_x", "eef_x"),
+    "y": ("y", "ty", "pos_y", "position_y", "eef_y"),
+    "z": ("z", "tz", "pos_z", "position_z", "eef_z"),
     "trajectory_id": ("trajectory_id", "episode_index", "episode_idx"),
 }
 
@@ -78,6 +78,8 @@ def load_dataset_lazy(
         casts.append(pl.col("state_vec").cast(pl.List(pl.Float64)))
     if "action_vec" in names:
         casts.append(pl.col("action_vec").cast(pl.List(pl.Float64)))
+    if "wrench_vec" in names:
+        casts.append(pl.col("wrench_vec").cast(pl.List(pl.Float64)))
     return frame.with_columns(casts)
 
 
@@ -177,6 +179,9 @@ def _load_hdf5(path: Path, *, include_states: bool, include_actions: bool, inclu
             cols["state_vec"] = np.asarray(state[:n], dtype=np.float64).tolist()
         if include_actions and action is not None and action.ndim == 2:
             cols["action_vec"] = np.asarray(action[:n], dtype=np.float64).tolist()
+        wrench = _h5_get_array(group, "wrench_vec", "force_torque", "ft", "wrench")
+        if wrench is not None and wrench.ndim == 2 and wrench.shape[1] >= 6:
+            cols["wrench_vec"] = np.asarray(wrench[:n, :6], dtype=np.float64).tolist()
 
         if include_images != "none":
             rgb_path = _h5_get_array(group, "image_rgb_path", "image/path", "rgb/path")
@@ -306,6 +311,9 @@ def _rlds_step_to_row(
         row["state_vec"] = [float(v) for v in state]
     if include_actions and isinstance(action, list):
         row["action_vec"] = [float(v) for v in action]
+    wrench = step.get("wrench_vec")
+    if isinstance(wrench, list) and len(wrench) >= 6:
+        row["wrench_vec"] = [float(v) for v in wrench[:6]]
     if include_images != "none":
         rgb = step.get("image_rgb_path")
         depth = step.get("image_depth_path")
@@ -379,11 +387,61 @@ def _normalize_table_lazy(
             pl.col("state_vec").list.get(2).fill_null(0.0).alias("z"),
         )
         names.update({"x", "y", "z"})
+    if "state_vec" not in names:
+        eef_pose_candidates = ("x", "y", "z", "eef_qx", "eef_qy", "eef_qz", "eef_qw")
+        if all(col in names for col in eef_pose_candidates):
+            out = out.with_columns(
+                pl.concat_list(
+                    [
+                        pl.col("x").cast(pl.Float64, strict=False),
+                        pl.col("y").cast(pl.Float64, strict=False),
+                        pl.col("z").cast(pl.Float64, strict=False),
+                        pl.col("eef_qx").cast(pl.Float64, strict=False),
+                        pl.col("eef_qy").cast(pl.Float64, strict=False),
+                        pl.col("eef_qz").cast(pl.Float64, strict=False),
+                        pl.col("eef_qw").cast(pl.Float64, strict=False),
+                    ]
+                ).alias("state_vec")
+            )
+            names.add("state_vec")
+    if "action_vec" not in names:
+        cmd_candidates = ("cmd_vx", "cmd_vy", "cmd_vz", "cmd_wx", "cmd_wy", "cmd_wz")
+        if all(col in names for col in cmd_candidates):
+            out = out.with_columns(
+                pl.concat_list(
+                    [
+                        pl.col("cmd_vx").cast(pl.Float64, strict=False),
+                        pl.col("cmd_vy").cast(pl.Float64, strict=False),
+                        pl.col("cmd_vz").cast(pl.Float64, strict=False),
+                        pl.col("cmd_wx").cast(pl.Float64, strict=False),
+                        pl.col("cmd_wy").cast(pl.Float64, strict=False),
+                        pl.col("cmd_wz").cast(pl.Float64, strict=False),
+                    ]
+                ).alias("action_vec")
+            )
+            names.add("action_vec")
     if "z" not in names:
         out = out.with_columns(pl.lit(0.0).alias("z"))
         names.add("z")
     if "x" not in names or "y" not in names:
         raise ValueError("input must provide x/y or recoverable state vectors")
+
+    if "wrench_vec" not in names:
+        ft_candidates = ("ft_fx", "ft_fy", "ft_fz", "ft_tx", "ft_ty", "ft_tz")
+        if all(col in names for col in ft_candidates):
+            out = out.with_columns(
+                pl.concat_list(
+                    [
+                        pl.col("ft_fx").cast(pl.Float64, strict=False),
+                        pl.col("ft_fy").cast(pl.Float64, strict=False),
+                        pl.col("ft_fz").cast(pl.Float64, strict=False),
+                        pl.col("ft_tx").cast(pl.Float64, strict=False),
+                        pl.col("ft_ty").cast(pl.Float64, strict=False),
+                        pl.col("ft_tz").cast(pl.Float64, strict=False),
+                    ]
+                ).alias("wrench_vec")
+            )
+            names.add("wrench_vec")
 
     if "frame_index" in names:
         out = out.with_columns(pl.col("frame_index").cast(pl.Int64).alias("frame_id"))
@@ -396,6 +454,7 @@ def _normalize_table_lazy(
     prefer = [
         "state_vec",
         "action_vec",
+        "wrench_vec",
         "frame_index",
         "episode_index",
         "task_index",
@@ -565,6 +624,7 @@ def _canonicalize_types(frame: pl.LazyFrame) -> pl.LazyFrame:
     maybe("z", pl.Float64)
     maybe("state_vec", pl.List(pl.Float64))
     maybe("action_vec", pl.List(pl.Float64))
+    maybe("wrench_vec", pl.List(pl.Float64))
     for c in sorted(names):
         if c.startswith("image_") and c.endswith("_path"):
             maybe(c, pl.String)

@@ -45,6 +45,11 @@ class Trajectory:
             return None
         return self._frame["action_vec"]
 
+    def force_torque_vectors(self):
+        if "wrench_vec" not in self._frame.columns:
+            return None
+        return self._frame["wrench_vec"]
+
     def image_paths(self) -> dict[str, list[str]]:
         groups = self.image_channels(kind="path", keep_null=False)
         return {**groups["rgb"], **groups["depth"], **groups["other"]}
@@ -84,6 +89,8 @@ class Trajectory:
             out["missing_state_rows"] = int(self._frame["state_vec"].null_count())
         if "action_vec" in self._frame.columns:
             out["missing_action_rows"] = int(self._frame["action_vec"].null_count())
+        if "wrench_vec" in self._frame.columns:
+            out["missing_wrench_rows"] = int(self._frame["wrench_vec"].null_count())
         for col in sorted(c for c in self._frame.columns if c.startswith("image_") and c.endswith("_path")):
             if col in self._frame.columns:
                 out[f"missing_{col}_rows"] = int(self._frame[col].null_count())
@@ -315,6 +322,28 @@ class Trajectory:
             axes_1d[i].set_ylabel(f"a[{i}]")
         axes_1d[-1].set_xlabel("t")
         fig.suptitle(f"Trajectory {self.id} action channels")
+        fig.tight_layout()
+        return fig
+
+    def plot_wrench_channels(self):
+        import matplotlib.pyplot as plt
+
+        if "wrench_vec" not in self._frame.columns:
+            raise ValueError("wrench_vec is not available for this trajectory")
+        wrench = self._frame["wrench_vec"].to_list()
+        if not wrench:
+            raise ValueError("empty trajectory")
+        arr = np.asarray(wrench, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] < 6:
+            raise ValueError("wrench_vec must have at least 6 channels [fx,fy,fz,tx,ty,tz]")
+        labels = ["fx", "fy", "fz", "tx", "ty", "tz"]
+        fig, axes = plt.subplots(nrows=6, ncols=1, figsize=(8, 10), sharex=True)
+        t = self._frame["t"].to_numpy()
+        for i, ax in enumerate(np.array(axes).reshape(-1)):
+            ax.plot(t, arr[:, i], linewidth=1.1)
+            ax.set_ylabel(labels[i])
+        axes[-1].set_xlabel("t")
+        fig.suptitle(f"Trajectory {self.id} wrench channels")
         fig.tight_layout()
         return fig
 
