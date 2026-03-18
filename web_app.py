@@ -391,7 +391,10 @@ def main() -> None:
                 tmp = Path(tmp_dir)
                 load_target = _write_uploaded_files(uploaded, tmp)
                 with st.spinner("Loading uploaded dataset..."):
-                    ds = TrajectoryDataset.load(load_target, include_images=include_images)
+                    # Important: upload files live in a temporary directory.
+                    # Materialize immediately so later lazy collects don't reference deleted temp paths.
+                    ds_tmp = TrajectoryDataset.load(load_target, include_images=include_images)
+                    ds = TrajectoryDataset(ds_tmp.frame)
                     summary = _light_summary(ds) if fast_mode else ds.summary()
                     feature_table = ds.feature_table() if run_advanced else None
     except Exception as exc:
