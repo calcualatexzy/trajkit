@@ -17,3 +17,4 @@ venv/
 .pycache/
 outputs/
 data/
+.streamlit/

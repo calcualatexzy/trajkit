@@ -89,6 +89,80 @@ class TrajectoryDataset:
     def lazy_frame(self) -> pl.LazyFrame:
         return self._lazy_frame
 
+    def canonical_frame(
+        self,
+        *,
+        expand_vectors: bool = False,
+        vector_columns: tuple[str, ...] = ("state_vec", "action_vec", "wrench_vec"),
+        drop_vector_columns: bool = False,
+    ) -> pl.DataFrame:
+        """Return a materialized canonical frame.
+
+        Args:
+            expand_vectors: Expand list-valued vector columns into scalar columns.
+            vector_columns: Vector columns to consider for expansion.
+            drop_vector_columns: If True, remove original vector list columns after expansion.
+        """
+        frame = self.frame
+        if not expand_vectors:
+            return frame
+
+        out = frame
+        expanded_exprs: list[pl.Expr] = []
+        to_drop: list[str] = []
+        for col in vector_columns:
+            if col not in out.columns:
+                continue
+            width = _max_list_width(out[col].to_list())
+            if width <= 0:
+                continue
+            expanded_exprs.extend(pl.col(col).list.get(i).alias(f"{col}_{i}") for i in range(width))
+            if drop_vector_columns:
+                to_drop.append(col)
+
+        if expanded_exprs:
+            out = out.with_columns(expanded_exprs)
+        if to_drop:
+            out = out.drop(to_drop)
+        return out
+
+    def save(
+        self,
+        path: PathLike,
+        *,
+        format: Literal["auto", "parquet", "csv", "jsonl"] = "auto",
+        expand_vectors: bool = False,
+        drop_vector_columns: bool = False,
+    ) -> Path:
+        """Save the dataset in a canonical schema.
+
+        When ``expand_vectors=True``, list columns (e.g. ``state_vec``) are exported as
+        scalar columns (e.g. ``state_vec_0``, ``state_vec_1``), which is often easier for CSV tools.
+        """
+        out_path = Path(path)
+        output_format = format
+        if format == "auto":
+            suffix = out_path.suffix.lower()
+            if suffix in {".parquet", ".csv", ".jsonl"}:
+                output_format = suffix.lstrip(".")
+            else:
+                raise ValueError("format='auto' requires a .parquet, .csv, or .jsonl extension")
+
+        frame = self.canonical_frame(
+            expand_vectors=expand_vectors,
+            drop_vector_columns=drop_vector_columns,
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_format == "parquet":
+            frame.write_parquet(out_path)
+        elif output_format == "csv":
+            frame.write_csv(out_path)
+        elif output_format == "jsonl":
+            frame.write_ndjson(out_path)
+        else:
+            raise ValueError("format must be one of: auto, parquet, csv, jsonl")
+        return out_path
+
     def __len__(self) -> int:
         out = self._lazy_frame.select(pl.col("trajectory_id").n_unique().alias("n")).collect()
         return int(out["n"][0])
@@ -288,3 +362,11 @@ def _looks_like_lerobot_dataset(obj: object) -> bool:
         return True
     # Generic dataset-like fallback if it also exposes a LeRobot-style root path.
     return hasattr(obj, "__len__") and hasattr(obj, "__getitem__") and hasattr(obj, "root")
+
+
+def _max_list_width(values: list[object]) -> int:
+    max_width = 0
+    for v in values:
+        if isinstance(v, list):
+            max_width = max(max_width, len(v))
+    return max_width

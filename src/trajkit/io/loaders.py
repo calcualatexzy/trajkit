@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
@@ -43,6 +44,7 @@ def load_dataset_lazy(
         raise FileNotFoundError(f"no supported files under {path}")
 
     frames: list[pl.LazyFrame] = []
+    skipped: list[tuple[Path, str]] = []
     for file in files:
         try:
             loaded = _load_single_file_lazy(
@@ -60,10 +62,22 @@ def load_dataset_lazy(
                     include_images=include_images,
                 )
             )
-        except ValueError:
-            continue
+        except Exception as exc:  # skip corrupt/unsupported files, fail only if nothing usable remains
+            if isinstance(exc, (ValueError, OSError, pl.exceptions.PolarsError)):
+                skipped.append((file, str(exc)))
+                continue
+            raise
     if not frames:
+        if skipped:
+            sample = "; ".join(f"{p.name}: {msg}" for p, msg in skipped[:3])
+            raise ValueError(f"no trajectory tables discovered under {path}; skipped files: {sample}")
         raise ValueError(f"no trajectory tables discovered under {path}")
+    if skipped:
+        warnings.warn(
+            f"Skipped {len(skipped)} unreadable files while loading dataset under {path}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     frame = pl.concat(frames, how="diagonal_relaxed")
     names = set(_schema_names(frame))
@@ -499,15 +513,54 @@ def _extract_vla_modalities(
     include_actions: bool,
     include_images: ImageMode,
 ) -> pl.LazyFrame:
-    names = set(_schema_names(frame))
+    schema = frame.collect_schema()
+    names = set(schema.names())
     exprs: list[pl.Expr] = []
+
+    def _dtype_is_struct(dtype: pl.DataType | None) -> bool:
+        if dtype is None:
+            return False
+        try:
+            return dtype.base_type() == pl.Struct  # type: ignore[attr-defined]
+        except Exception:
+            return str(dtype).startswith("Struct")
+
+    def _dtype_is_list_like(dtype: pl.DataType | None) -> bool:
+        if dtype is None:
+            return False
+        try:
+            base = dtype.base_type()  # type: ignore[attr-defined]
+            return base in (pl.List, pl.Array)
+        except Exception:
+            text = str(dtype)
+            return text.startswith("List") or text.startswith("Array")
+
+    def _struct_field_names(dtype: pl.DataType | None) -> set[str]:
+        if dtype is None:
+            return set()
+        try:
+            return {f.name for f in dtype.fields}  # type: ignore[attr-defined]
+        except Exception:
+            return set()
+
+    def timestamp_expr() -> pl.Expr:
+        if "timestamp" not in names:
+            return pl.lit(None, dtype=pl.Float64)
+        ts_raw = pl.col("timestamp")
+        # Robustly support scalar timestamp, list-like timestamp, and mixed/null values.
+        ts_scalar = ts_raw.cast(pl.Float64, strict=False)
+        ts_list_head = ts_raw.cast(pl.List(pl.Float64), strict=False).list.get(0).cast(pl.Float64, strict=False)
+        ts = pl.coalesce(ts_scalar, ts_list_head)
+        if "step_idx" in names:
+            return pl.coalesce(ts, pl.col("step_idx").cast(pl.Float64, strict=False))
+        return ts
 
     is_bridge = {"state", "episode_idx"}.issubset(names)
     if is_bridge:
         exprs.extend(
             [
                 pl.col("episode_idx").cast(pl.String).alias("trajectory_id"),
-                pl.coalesce(pl.col("timestamp"), pl.col("step_idx").cast(pl.Float64)).alias("t"),
+                timestamp_expr().alias("t"),
                 pl.col("state").struct.field("end_effector_pose").struct.field("x").alias("x"),
                 pl.col("state").struct.field("end_effector_pose").struct.field("y").alias("y"),
                 pl.col("state").struct.field("end_effector_pose").struct.field("z").alias("z"),
@@ -544,14 +597,60 @@ def _extract_vla_modalities(
         if "episode_index" in names:
             exprs.append(pl.col("episode_index").cast(pl.String).alias("trajectory_id"))
         if "timestamp" in names:
-            exprs.append(pl.col("timestamp").cast(pl.Float64).alias("t"))
+            exprs.append(timestamp_expr().alias("t"))
+        obs_state_dtype = schema.get("observation.state") if "observation.state" in names else None
+        obs_state_fields = _struct_field_names(obs_state_dtype)
         if include_states and "observation.state" in names:
-            exprs.append(pl.col("observation.state").cast(pl.List(pl.Float64)).alias("state_vec"))
+            if _dtype_is_list_like(obs_state_dtype):
+                exprs.append(pl.col("observation.state").cast(pl.List(pl.Float64), strict=False).alias("state_vec"))
+            elif _dtype_is_struct(obs_state_dtype):
+                if "end_effector_pose" in obs_state_fields:
+                    pose = pl.col("observation.state").struct.field("end_effector_pose")
+                    state_parts = [pose.struct.field("x"), pose.struct.field("y"), pose.struct.field("z")]
+                    # Optional orientation channels if present.
+                    for ang in ("roll", "pitch", "yaw"):
+                        state_parts.append(pose.struct.field(ang).cast(pl.Float64, strict=False))
+                    exprs.append(pl.concat_list(state_parts).alias("state_vec"))
+                elif {"x", "y", "z"}.issubset(obs_state_fields):
+                    exprs.append(
+                        pl.concat_list(
+                            [
+                                pl.col("observation.state").struct.field("x").cast(pl.Float64, strict=False),
+                                pl.col("observation.state").struct.field("y").cast(pl.Float64, strict=False),
+                                pl.col("observation.state").struct.field("z").cast(pl.Float64, strict=False),
+                            ]
+                        ).alias("state_vec")
+                    )
         if include_actions and "action" in names:
             exprs.append(pl.col("action").cast(pl.List(pl.Float64)).alias("action_vec"))
         if "observation.state" in names:
-            s = pl.col("observation.state").cast(pl.List(pl.Float64))
-            exprs.extend([s.list.get(0).alias("x"), s.list.get(1).alias("y"), s.list.get(2).fill_null(0.0).alias("z")])
+            if _dtype_is_list_like(obs_state_dtype):
+                s = pl.col("observation.state").cast(pl.List(pl.Float64), strict=False)
+                exprs.extend(
+                    [
+                        s.list.get(0).cast(pl.Float64, strict=False).alias("x"),
+                        s.list.get(1).cast(pl.Float64, strict=False).alias("y"),
+                        s.list.get(2).cast(pl.Float64, strict=False).fill_null(0.0).alias("z"),
+                    ]
+                )
+            elif _dtype_is_struct(obs_state_dtype):
+                if "end_effector_pose" in obs_state_fields:
+                    pose = pl.col("observation.state").struct.field("end_effector_pose")
+                    exprs.extend(
+                        [
+                            pose.struct.field("x").cast(pl.Float64, strict=False).alias("x"),
+                            pose.struct.field("y").cast(pl.Float64, strict=False).alias("y"),
+                            pose.struct.field("z").cast(pl.Float64, strict=False).fill_null(0.0).alias("z"),
+                        ]
+                    )
+                elif {"x", "y", "z"}.issubset(obs_state_fields):
+                    exprs.extend(
+                        [
+                            pl.col("observation.state").struct.field("x").cast(pl.Float64, strict=False).alias("x"),
+                            pl.col("observation.state").struct.field("y").cast(pl.Float64, strict=False).alias("y"),
+                            pl.col("observation.state").struct.field("z").cast(pl.Float64, strict=False).fill_null(0.0).alias("z"),
+                        ]
+                    )
 
     if include_images != "none":
         image_specs = [
